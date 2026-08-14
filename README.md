@@ -58,9 +58,28 @@ This script pulls IP blacklists from multiple threat intelligence sources, dedup
 | blocklist.de Attackers | `lists.blocklist.de/lists/all.txt` |
 | GreenSnow | `blocklist.greensnow.co/greensnow.txt` |
 | FireHOL Level 1 | `raw.githubusercontent.com/firehol/blocklist-ipsets/master/firehol_level1.netset` |
+| AbuseIPDB (30 days) | `raw.githubusercontent.com/borestad/blocklist-abuseipdb/main/abuseipdb-s100-30d.ipv4` |
+| FireHOL Level 2 | `raw.githubusercontent.com/firehol/blocklist-ipsets/master/firehol_level2.netset` |
+| FireHOL Level 3 | `raw.githubusercontent.com/firehol/blocklist-ipsets/master/firehol_level3.netset` |
+| Emerging Threats (Compromised) | `rules.emergingthreats.net/blockrules/compromised-ips.txt` |
+| abuse.ch Feodo Tracker (Botnet C2) | `feodotracker.abuse.ch/downloads/ipblocklist.txt` |
+| Binary Defense Artillery Banlist | `www.binarydefense.com/banlist.txt` |
 | Custom Local Source | `http://172.16.0.250:8741/security/blocklist` |
 
 Sources are configurable — edit the `BLACKLIST_URLS` list in the script.
+
+### AbuseIPDB
+
+The AbuseIPDB feed comes from
+[borestad/blocklist-abuseipdb](https://github.com/borestad/blocklist-abuseipdb),
+built from [AbuseIPDB](https://www.abuseipdb.com/) data — **please support them**.
+At ~113 000 entries it is by far the largest source. Windows from `1d` to `90d`
+are published; swap the file name in the URL to trade coverage against freshness.
+Upstream recommends **30 days at most** to limit false positives, and asks that
+`abuseipdb-s100-all` not be used, as it is published for statistics only.
+
+Together the configured sources yield roughly **150 000 unique prefixes**,
+collapsing to about **114 000** entries.
 
 ## Prerequisites
 
@@ -118,6 +137,7 @@ sudo ./update-blacklist.py
 | `--dry-run` | Fetch, parse, and process IPs but make **no system changes**. Prints what would be injected. |
 | `--force-config-stub` | Force re-creation of the VyOS config stub node. Needed on first run or if the network-group was deleted from the VyOS config tree. |
 | `--timeout <seconds>` | HTTP timeout per URL (default: 30). Increase if your sources are slow or you're on a slow link. |
+| `--no-nft-check` | Skip the `nft -c` syntax validation. Only needed on systems where the `vyos_filter` table does not exist, since `nft -c` fails there for reasons unrelated to the generated script. |
 
 ### Examples
 
@@ -206,7 +226,8 @@ VyOS expects network-groups it uses in firewall rules to be present in its confi
 ### Atomic Operations
 
 - The nftables set is **flushed and repopulated in a single atomic transaction** — there is no window where the set is empty.
-- The persistence file is written **atomically** via `os.replace()` (temp file → rename).
+- The persistence file is written **atomically** via `os.replace()` (temp file → validate with `nft -c` → rename). A script that fails validation is discarded and the previous file stays in place.
+- Feeds are fetched with `Accept-Encoding: gzip` and transparently decompressed, which takes the largest source from 6.1 MB to 820 KB. A server that ignores the header, or mislabels its encoding, is handled by falling back to the raw body.
 - The boot hook is **idempotent** — a marker comment prevents duplicate entries.
 
 ## File Locations
@@ -261,7 +282,7 @@ Sample output:
 - **Root execution required** — `nft` commands need elevated privileges. Review the script before running as root.
 - **HTTP sources** — One source uses plain HTTP. A MITM could inject malicious IPs. Consider proxying sensitive sources through HTTPS.
 - **No traffic filtering** — This script only populates an nftables set. You must configure a firewall rule that **references** the `Internet-Blacklist` network-group to actually drop traffic.
-- **Boot hook risk** — If an nft restore file is malformed on boot, it could delay the firewall coming up. The script verifies syntax by running `nft -f` before writing.
+- **Boot hook risk** — If an nft restore file is malformed on boot, it could delay the firewall coming up. The script validates every generated script with `nft -c` (parse and check, no changes applied) before applying the live batch and before promoting the persistence file, so a malformed script cannot replace a working one. Use `--no-nft-check` to bypass this.
 
 ## Firewall Rule Example
 
@@ -281,6 +302,7 @@ save
 | Symptom | Likely Cause | Resolution |
 |---------|-------------|-----------|
 | `nftables injection failed` | nftables set doesn't exist | Run with `--force-config-stub` |
+| `nft syntax check failed` | The `vyos_filter` table is missing, or a source returned something the generator cannot express | Check `nft list tables`; bypass with `--no-nft-check` if the table is genuinely absent |
 | `Failed to fetch` | Network issue or source changed | Check connectivity, increase `--timeout` |
 | `No valid IP entries found` | All sources failed or returned empty | Check source URLs and network |
 | Set exists but traffic not blocked | No firewall rule references it | Add a firewall rule (see example above) |
