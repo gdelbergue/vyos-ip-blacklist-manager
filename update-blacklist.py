@@ -16,6 +16,7 @@ Usage:
 """
 
 import argparse
+import gzip
 import ipaddress
 import logging
 import logging.handlers
@@ -52,6 +53,16 @@ BLACKLIST_URLS = [
     "https://lists.blocklist.de/lists/all.txt", # blocklist.de attackers
     "https://blocklist.greensnow.co/greensnow.txt", # GreenSnow
     "https://raw.githubusercontent.com/firehol/blocklist-ipsets/master/firehol_level1.netset", # Firehol Level 1
+    # AbuseIPDB worst offenders, courtesy of https://www.abuseipdb.com - please
+    # support them.  Largest source by far (~113k entries).  Swap the file name
+    # for 1d/3d/7d/14d/60d/90d to trade coverage against freshness; upstream
+    # recommends 30 days at most to limit false positives.
+    "https://raw.githubusercontent.com/borestad/blocklist-abuseipdb/main/abuseipdb-s100-30d.ipv4", # AbuseIPDB (30 days)
+    "https://raw.githubusercontent.com/firehol/blocklist-ipsets/master/firehol_level2.netset", # Firehol Level 2
+    "https://raw.githubusercontent.com/firehol/blocklist-ipsets/master/firehol_level3.netset", # Firehol Level 3
+    "https://rules.emergingthreats.net/blockrules/compromised-ips.txt", # Emerging Threats compromised hosts
+    "https://feodotracker.abuse.ch/downloads/ipblocklist.txt", # abuse.ch Feodo Tracker botnet C2
+    "https://www.binarydefense.com/banlist.txt", # Binary Defense Artillery banlist
     "http://172.16.0.250:8741/security/blocklist"
 ]
 
@@ -95,6 +106,10 @@ def parse_arguments() -> argparse.Namespace:
                         "or if the network-group was deleted from the config tree).")
     p.add_argument("--timeout", type=int, default=30,
                    help="HTTP timeout per URL in seconds (default: 30).")
+    p.add_argument("--no-nft-check", action="store_true",
+                   help="Skip 'nft -c' syntax validation before applying the batch and "
+                        "before promoting the persistence file. Only needed on systems "
+                        "where the vyos_filter table is absent.")
     return p.parse_args()
 
 # -- NETWORK PARSING -----------------------------------------------------------
@@ -116,6 +131,30 @@ def _iter_networks_from_text(text: str) -> Iterator[ipaddress.IPv4Network]:
         except ValueError:
             pass
 
+def _http_get_text(url: str, timeout: int) -> str:
+    """
+    Fetch a URL and return its body as text.
+
+    Advertises gzip support: the larger feeds compress by roughly a factor of
+    seven, which matters on a router's WAN link.  Falls back to the raw bytes if
+    decompression fails, since not every server labels its encoding correctly.
+    """
+    req = urllib.request.Request(url, headers={
+        "User-Agent": "VyOS-Blacklist-Bot/2.0",
+        "Accept-Encoding": "gzip",
+    })
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        body = resp.read()
+        encoding = resp.headers.get("Content-Encoding", "").lower()
+
+    if encoding == "gzip" or body[:2] == b"\x1f\x8b":
+        try:
+            body = gzip.decompress(body)
+        except (OSError, EOFError) as exc:
+            logger.debug("gzip decompression failed for %s, using raw body: %s", url, exc)
+
+    return body.decode("utf-8", errors="ignore")
+
 def fetch_and_parse(urls: list[str], timeout: int = 30) -> list[ipaddress.IPv4Network]:
     """
     Fetch all URLs and return a deduplicated list of IPv4Network objects.
@@ -128,9 +167,7 @@ def fetch_and_parse(urls: list[str], timeout: int = 30) -> list[ipaddress.IPv4Ne
     for url in urls:
         logger.info("Fetching: %s", url)
         try:
-            req = urllib.request.Request(url, headers={"User-Agent": "VyOS-Blacklist-Bot/2.0"})
-            with urllib.request.urlopen(req, timeout=timeout) as resp:
-                text = resp.read().decode("utf-8", errors="ignore")
+            text = _http_get_text(url, timeout)
             before = len(raw_strings)
             for net in _iter_networks_from_text(text):
                 raw_strings.add(str(net))
@@ -196,16 +233,35 @@ def apply_whitelist(
 # -- NFTABLES DIRECT INJECTION (TIER 1: LIVE) ---------------------------------
 
 def _nft_run(args: list[str], input_text: str | None = None) -> subprocess.CompletedProcess:
-    """Run an nft command, return CompletedProcess. Raises RuntimeError on failure."""
+    """
+    Run an nft command and return the CompletedProcess.
+
+    A missing nft binary is reported as a non-zero result rather than an
+    exception, so callers can treat "nft unavailable" like any other failure -
+    this keeps --dry-run usable on a workstation.
+    """
     cmd = ["nft"] + args
-    result = subprocess.run(
-        cmd,
-        input=input_text,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-    )
-    return result
+    try:
+        return subprocess.run(
+            cmd,
+            input=input_text,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+    except FileNotFoundError:
+        return subprocess.CompletedProcess(cmd, 1, "", "nft binary not found in PATH")
+
+def _nft_check(script: str) -> tuple[bool, str]:
+    """
+    Dry-run an nft script through 'nft -c' without applying it.
+
+    Note that 'flush set' only validates against a set that already exists, so
+    callers must ensure the set is present before checking a script built by
+    _build_nft_flush_add().
+    """
+    r = _nft_run(["-c", "-f", "-"], input_text=script)
+    return r.returncode == 0, r.stderr.strip()
 
 def _set_exists() -> bool:
     """Check whether the nftables set already exists."""
@@ -238,12 +294,14 @@ def _build_nft_flush_add(networks: list[ipaddress.IPv4Network]) -> str:
     Using a single 'nft -f -' transaction keeps the firewall in a consistent
     state - there is no window where the set is empty.
     """
-    lines = [
-        f"flush set {NFT_TABLE} {NFT_SET_NAME}",
-        f"add element {NFT_TABLE} {NFT_SET_NAME} {{",
-    ]
-    # nft element lists: "a.b.c.d/p, ..." - we batch 500 per add statement
-    # to avoid hitting kernel netlink message size limits on huge lists.
+    lines = [f"flush set {NFT_TABLE} {NFT_SET_NAME}"]
+    if not networks:
+        # An empty "add element { }" is a syntax error, so emit the flush alone.
+        return "\n".join(lines) + "\n"
+
+    lines.append(f"add element {NFT_TABLE} {NFT_SET_NAME} {{")
+    # Element lists are wrapped at 500 per line purely for readability; nft
+    # handles splitting the resulting netlink messages itself.
     BATCH_SIZE = 500
     for i in range(0, len(networks), BATCH_SIZE):
         chunk = networks[i : i + BATCH_SIZE]
@@ -252,7 +310,11 @@ def _build_nft_flush_add(networks: list[ipaddress.IPv4Network]) -> str:
     lines.append("}")
     return "\n".join(lines) + "\n"
 
-def inject_nftables(networks: list[ipaddress.IPv4Network], dry_run: bool = False) -> None:
+def inject_nftables(
+    networks: list[ipaddress.IPv4Network],
+    dry_run: bool = False,
+    check: bool = True,
+) -> None:
     """Atomically replace the nftables set contents (live, no commit required)."""
     t0 = time.monotonic()
     logger.info("Preparing nftables batch for %d networks...", len(networks))
@@ -265,9 +327,27 @@ def inject_nftables(networks: list[ipaddress.IPv4Network], dry_run: bool = False
                     len(nft_script.splitlines()), "\n".join(preview_lines))
         if len(nft_script.splitlines()) > 20:
             logger.info("[DRY-RUN] ... (truncated)")
+        # The batch flushes the set, so it can only be validated if the set is
+        # already there.  On a first run it is not, and creating it would be a
+        # system change - which --dry-run promises not to make.
+        if check and _set_exists():
+            ok, err = _nft_check(nft_script)
+            if ok:
+                logger.info("[DRY-RUN] nft syntax check passed.")
+            else:
+                logger.error("[DRY-RUN] nft syntax check FAILED:\n%s", err)
+        elif check:
+            logger.info("[DRY-RUN] Skipping nft syntax check: set %s does not exist yet.",
+                        NFT_SET_NAME)
         return
 
     _ensure_set_exists()
+
+    if check:
+        ok, err = _nft_check(nft_script)
+        if not ok:
+            raise RuntimeError(f"nft syntax check failed, batch not applied: {err}")
+        logger.debug("nft syntax check passed.")
 
     r = _nft_run(["-f", "-"], input_text=nft_script)
     elapsed = time.monotonic() - t0
@@ -284,6 +364,7 @@ def inject_nftables(networks: list[ipaddress.IPv4Network], dry_run: bool = False
 def write_persistence_file(
     networks: list[ipaddress.IPv4Network],
     dry_run: bool = False,
+    check: bool = True,
 ) -> None:
     """
     Write an nft restore file that VyOS will re-apply after boot.
@@ -291,6 +372,10 @@ def write_persistence_file(
     File format: a complete 'nft -f' compatible script that adds the set
     (if missing) and populates it.  Placed in /config/scripts/nft-sets/
     which is part of the VyOS config partition and survives upgrades.
+
+    The candidate file is validated with 'nft -c' before being promoted, so a
+    malformed script can never replace a working one and stall the firewall at
+    boot.
     """
     set_dir = os.path.dirname(NFT_PERSIST_FILE)
 
@@ -304,13 +389,14 @@ def write_persistence_file(
         "",
         f"add set {NFT_TABLE} {NFT_SET_NAME} {{ type ipv4_addr; flags interval; auto-merge; }}",
         f"flush set {NFT_TABLE} {NFT_SET_NAME}",
-        f"add element {NFT_TABLE} {NFT_SET_NAME} {{",
     ]
-    BATCH_SIZE = 500
-    for i in range(0, len(networks), BATCH_SIZE):
-        chunk = networks[i : i + BATCH_SIZE]
-        lines.append("  " + ", ".join(str(n) for n in chunk) + ",")
-    lines.append("}")
+    if networks:
+        lines.append(f"add element {NFT_TABLE} {NFT_SET_NAME} {{")
+        BATCH_SIZE = 500
+        for i in range(0, len(networks), BATCH_SIZE):
+            chunk = networks[i : i + BATCH_SIZE]
+            lines.append("  " + ", ".join(str(n) for n in chunk) + ",")
+        lines.append("}")
     content = "\n".join(lines) + "\n"
 
     if dry_run:
@@ -326,6 +412,15 @@ def write_persistence_file(
         with os.fdopen(fd, "w") as fh:
             fh.write(content)
         os.chmod(tmp_path, 0o644)
+
+        if check:
+            ok, err = _nft_check(content)
+            if not ok:
+                raise RuntimeError(
+                    f"nft syntax check failed, persistence file left untouched: {err}"
+                )
+            logger.debug("Persistence file syntax check passed.")
+
         os.replace(tmp_path, NFT_PERSIST_FILE)
         logger.info("Persistence file written: %s", NFT_PERSIST_FILE)
     except Exception:
@@ -441,6 +536,7 @@ def create_config_stub(group_name: str, dry_run: bool = False) -> None:
 
 def main() -> None:
     args = parse_arguments()
+    check = not args.no_nft_check
     t_start = time.monotonic()
 
     # -- 1. Fetch & Parse ----------------------------------------------------
@@ -469,7 +565,7 @@ def main() -> None:
 
     # -- 5. Live nftables Injection (Tier 1) ----------------------------------
     try:
-        inject_nftables(optimized, dry_run=args.dry_run)
+        inject_nftables(optimized, dry_run=args.dry_run, check=check)
     except RuntimeError as exc:
         logger.critical("Live nftables injection failed: %s", exc)
         # Still write persistence file so next boot loads the correct set
@@ -477,7 +573,7 @@ def main() -> None:
 
     # -- 6. Write Persistence File (Tier 2) -----------------------------------
     try:
-        write_persistence_file(optimized, dry_run=args.dry_run)
+        write_persistence_file(optimized, dry_run=args.dry_run, check=check)
     except Exception as exc:
         logger.error("Failed to write persistence file: %s", exc)
 
